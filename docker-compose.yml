@@ -1,0 +1,112 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: psdm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: psdm
+      TZ: Asia/Shanghai
+    ports:
+      - "5432:5432"
+    volumes:
+      - psdm_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d psdm"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    container_name: psdm-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - psdm_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: psdm-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      APP_PORT: 3000
+      APP_BASE_URL: http://localhost:3000
+      FRONTEND_BASE_URL: http://localhost:8080
+      DATABASE_URL: postgresql://app:app@postgres:5432/psdm?schema=public
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-local-development-secret-change-me-32chars}
+      STORAGE_DRIVER: local
+      STORAGE_PUBLIC_DIR: /app/storage/public
+      STORAGE_PRIVATE_DIR: /app/storage/private
+      MAIL_DRIVER: console
+      GEOCODING_PROVIDER: nominatim
+    ports:
+      - "3000:3000"
+    volumes:
+      - psdm_storage:/app/storage
+    command: sh -c "npx prisma migrate deploy && node dist/server.js"
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: psdm-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://app:app@postgres:5432/psdm?schema=public
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:-local-development-secret-change-me-32chars}
+      STORAGE_DRIVER: local
+      STORAGE_PUBLIC_DIR: /app/storage/public
+      STORAGE_PRIVATE_DIR: /app/storage/private
+      MAIL_DRIVER: console
+    volumes:
+      - psdm_storage:/app/storage
+    command: node dist/worker.js
+    healthcheck:
+      test: ["CMD", "node", "dist/scripts/worker-health.js"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: http://localhost:3000/api/v1
+    container_name: psdm-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  psdm_pgdata:
+  psdm_redisdata:
+  psdm_storage:

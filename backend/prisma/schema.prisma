@@ -1,0 +1,473 @@
+// 公共空间细节地图 - 数据模型
+// 与《项目文档.md》第 9 章一一对应
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  visitor
+  user
+  moderator
+  admin
+}
+
+enum UserStatus {
+  active
+  muted
+  banned
+  deleted
+}
+
+enum SpotStatus {
+  draft
+  pending
+  in_review
+  auto_rejected
+  changes_requested
+  approved
+  published
+  rejected
+  appealing
+  rejected_final
+  hidden
+  archived
+}
+
+enum ReviewStatus {
+  pending
+  in_review
+  approved
+  changes_requested
+  rejected
+  auto_rejected
+  appealed
+  appeal_approved
+  appeal_rejected
+}
+
+enum PrivacyStatus {
+  processing
+  auto_clean
+  auto_blurred
+  needs_manual
+  manual_blurred
+  confirmed
+  failed
+}
+
+enum CommentStatus {
+  pending
+  visible
+  hidden
+  deleted
+}
+
+enum ReportStatus {
+  open
+  in_review
+  resolved
+  dismissed
+}
+
+enum BlurSource {
+  auto
+  manual
+}
+
+enum BlurAlgorithm {
+  pixelate
+  gaussian
+}
+
+model User {
+  id            BigInt     @id @default(autoincrement())
+  uuid          String     @unique @default(uuid()) @db.Uuid
+  email         String?    @unique
+  phone         String?    @unique
+  passwordHash  String     @map("password_hash")
+  nickname      String     @db.VarChar(32)
+  avatarUrl     String?    @map("avatar_url")
+  role          UserRole   @default(user)
+  status        UserStatus @default(active)
+  creditScore   Int        @default(100) @map("credit_score") @db.SmallInt
+  approvedCount Int        @default(0) @map("approved_count")
+  mutedUntil    DateTime?  @map("muted_until") @db.Timestamptz(6)
+  banReason     String?    @map("ban_reason")
+  emailNotify   Boolean    @default(true) @map("email_notify")
+  lastLoginAt   DateTime?  @map("last_login_at") @db.Timestamptz(6)
+  createdAt     DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt     DateTime?  @map("deleted_at") @db.Timestamptz(6)
+
+  refreshTokens     RefreshToken[]
+  spots             Spot[]
+  spotRevisions     SpotRevision[]
+  mediaAssets       MediaAsset[]
+  mediaConfirmed    MediaAsset[]       @relation("MediaPrivacyConfirmedBy")
+  comments          Comment[]
+  confirmations     SpotConfirmation[]
+  favorites         Favorite[]
+  reportsFiled      Report[]           @relation("ReportReporter")
+  reportsHandled    Report[]           @relation("ReportHandler")
+  notifications     Notification[]
+  auditLogs         AuditLog[]
+  reviewTasksLocked ReviewTask[]       @relation("ReviewAssignedTo")
+  reviewTasksDecided ReviewTask[]      @relation("ReviewDecidedBy")
+  blurRegions       BlurRegion[]
+  categorySchemas   CategorySchema[]
+  settings          UserSetting?
+
+  @@index([role, status], map: "idx_users_role_status")
+  @@map("users")
+}
+
+model RefreshToken {
+  id        BigInt    @id @default(autoincrement())
+  userId    BigInt    @map("user_id")
+  tokenHash String    @unique @map("token_hash")
+  userAgent String?   @map("user_agent")
+  ip        String?   @db.Inet
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(6)
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
+  // 撤销原因：rotated（正常轮换）/ logout / banned / password_changed。
+  // 轮换产生的撤销允许极短的重用宽限期，避免多标签页互相把对方踢下线；
+  // 其他原因的撤销必须立即失效，不给窃取者留窗口。
+  revokedReason String? @map("revoked_reason")
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId], map: "idx_refresh_user")
+  @@map("refresh_tokens")
+}
+
+model UserSetting {
+  userId            BigInt   @id @map("user_id")
+  defaultFuzzRadius Int      @default(50) @map("default_fuzz_radius") @db.SmallInt
+  notifyEmail       Boolean  @default(true) @map("notify_email")
+  notifyInapp       Boolean  @default(true) @map("notify_inapp")
+  locale            String   @default("zh-CN") @db.VarChar(8)
+  updatedAt         DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_settings")
+}
+
+model Category {
+  id          BigInt   @id @default(autoincrement())
+  code        String   @unique @db.VarChar(32)
+  name        String   @db.VarChar(32)
+  icon        String   @db.VarChar(64)
+  color       String   @db.VarChar(16)
+  description String?
+  sortOrder   Int      @default(0) @map("sort_order")
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  schemas CategorySchema[]
+  spots   Spot[]
+
+  @@map("categories")
+}
+
+model CategorySchema {
+  id         BigInt   @id @default(autoincrement())
+  categoryId BigInt   @map("category_id")
+  version    Int
+  schema     Json
+  isCurrent  Boolean  @default(true) @map("is_current")
+  createdBy  BigInt?  @map("created_by")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  creator  User?    @relation(fields: [createdBy], references: [id])
+
+  @@unique([categoryId, version], map: "category_schemas_category_id_version_key")
+  @@index([categoryId, isCurrent], map: "idx_category_schema_current")
+  @@map("category_schemas")
+}
+
+model Spot {
+  id                 BigInt     @id @default(autoincrement())
+  uuid               String     @unique @default(uuid()) @db.Uuid
+  ownerId            BigInt     @map("owner_id")
+  categoryId         BigInt     @map("category_id")
+  status             SpotStatus @default(draft)
+  title              String     @db.VarChar(40)
+  description        String?    @db.VarChar(500)
+  attributes         Json       @default("{}")
+  exactLat           Float      @map("exact_lat")
+  exactLng           Float      @map("exact_lng")
+  publicLat          Float?     @map("public_lat")
+  publicLng          Float?     @map("public_lng")
+  fuzzRadiusM        Int        @default(50) @map("fuzz_radius_m") @db.SmallInt
+  fuzzEnabled        Boolean    @default(true) @map("fuzz_enabled")
+  addressText        String?    @map("address_text")
+  freshnessScore     Int        @default(0) @map("freshness_score") @db.SmallInt
+  isStale            Boolean    @default(false) @map("is_stale")
+  confirmCount       Int        @default(0) @map("confirm_count")
+  staleReportCount   Int        @default(0) @map("stale_report_count")
+  currentRevisionId  BigInt?    @map("current_revision_id")
+  publishedAt        DateTime?  @map("published_at") @db.Timestamptz(6)
+  archivedAt         DateTime?  @map("archived_at") @db.Timestamptz(6)
+  deletedAt          DateTime?  @map("deleted_at") @db.Timestamptz(6)
+  createdAt          DateTime   @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  owner         User              @relation(fields: [ownerId], references: [id])
+  category      Category          @relation(fields: [categoryId], references: [id])
+  revisions     SpotRevision[]
+  media         MediaAsset[]
+  reviewTasks   ReviewTask[]
+  comments      Comment[]
+  confirmations SpotConfirmation[]
+  favorites     Favorite[]
+
+  @@index([publicLat, publicLng], map: "idx_spots_geo_public")
+  @@index([categoryId, status], map: "idx_spots_category")
+  @@index([ownerId, status], map: "idx_spots_owner")
+  @@index([status, isStale], map: "idx_spots_stale")
+  @@map("spots")
+}
+
+model SpotRevision {
+  id            BigInt   @id @default(autoincrement())
+  spotId        BigInt   @map("spot_id")
+  revisionNo    Int      @map("revision_no")
+  editorId      BigInt   @map("editor_id")
+  snapshot      Json
+  schemaVersion Int      @map("schema_version")
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  spot         Spot         @relation(fields: [spotId], references: [id], onDelete: Cascade)
+  editor       User         @relation(fields: [editorId], references: [id])
+  reviewTasks  ReviewTask[]
+
+  @@unique([spotId, revisionNo], map: "spot_revisions_spot_id_revision_no_key")
+  @@map("spot_revisions")
+}
+
+model MediaAsset {
+  id                 BigInt        @id @default(autoincrement())
+  uuid               String        @unique @default(uuid()) @db.Uuid
+  ownerId            BigInt        @map("owner_id")
+  spotId             BigInt?       @map("spot_id")
+  contentHash        String        @map("content_hash") @db.Char(64)
+  originalPath       String?       @map("original_path")
+  originalSize       BigInt        @map("original_size")
+  originalMime       String        @map("original_mime") @db.VarChar(64)
+  width              Int
+  height             Int
+  variants           Json          @default("{}")
+  variantVersion     Int           @default(1) @map("variant_version")
+  exifStripped       Boolean       @default(false) @map("exif_stripped")
+  privacyStatus      PrivacyStatus @default(processing) @map("privacy_status")
+  privacyConfirmedBy BigInt?       @map("privacy_confirmed_by")
+  privacyConfirmedAt DateTime?     @map("privacy_confirmed_at") @db.Timestamptz(6)
+  detectionMeta      Json?         @map("detection_meta")
+  retryCount         Int           @default(0) @map("retry_count") @db.SmallInt
+  purgeAfter         DateTime?     @map("purge_after") @db.Timestamptz(6)
+  createdAt          DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt          DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  owner           User         @relation(fields: [ownerId], references: [id])
+  spot            Spot?        @relation(fields: [spotId], references: [id], onDelete: SetNull)
+  privacyConfirmer User?       @relation("MediaPrivacyConfirmedBy", fields: [privacyConfirmedBy], references: [id])
+  blurRegions     BlurRegion[]
+
+  @@index([spotId], map: "idx_media_spot")
+  @@index([privacyStatus], map: "idx_media_privacy")
+  @@index([contentHash], map: "idx_media_hash")
+  @@index([purgeAfter], map: "idx_media_purge")
+  @@map("media_assets")
+}
+
+model BlurRegion {
+  id           BigInt        @id @default(autoincrement())
+  assetId      BigInt        @map("asset_id")
+  source       BlurSource
+  algorithm    BlurAlgorithm @default(pixelate)
+  x            Float
+  y            Float
+  w            Float
+  h            Float
+  strength     Int           @default(12) @db.SmallInt
+  label        String?       @db.VarChar(32)
+  confidence   Float?
+  ignored      Boolean       @default(false)
+  ignoreReason String?       @map("ignore_reason")
+  createdBy    BigInt?       @map("created_by")
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  asset   MediaAsset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  creator User?      @relation(fields: [createdBy], references: [id])
+
+  @@index([assetId, ignored], map: "idx_blur_asset")
+  @@map("blur_regions")
+}
+
+model ReviewTask {
+  id              BigInt       @id @default(autoincrement())
+  spotId          BigInt       @map("spot_id")
+  revisionId      BigInt       @map("revision_id")
+  status          ReviewStatus @default(pending)
+  priority        Int          @default(0) @db.SmallInt
+  autoCheck       Json?        @map("auto_check")
+  assignedTo      BigInt?      @map("assigned_to")
+  lockedUntil     DateTime?    @map("locked_until") @db.Timestamptz(6)
+  decidedBy       BigInt?      @map("decided_by")
+  decisionReason  String?      @map("decision_reason")
+  reasonCode      String?      @map("reason_code") @db.VarChar(48)
+  appealOfTaskId  BigInt?      @map("appeal_of_task_id")
+  appealText      String?      @map("appeal_text")
+  appealDeadline  DateTime?    @map("appeal_deadline") @db.Timestamptz(6)
+  slaDueAt        DateTime     @map("sla_due_at") @db.Timestamptz(6)
+  decidedAt       DateTime?    @map("decided_at") @db.Timestamptz(6)
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  spot         Spot         @relation(fields: [spotId], references: [id], onDelete: Cascade)
+  revision     SpotRevision @relation(fields: [revisionId], references: [id], onDelete: Cascade)
+  assignee     User?        @relation("ReviewAssignedTo", fields: [assignedTo], references: [id])
+  decider      User?        @relation("ReviewDecidedBy", fields: [decidedBy], references: [id])
+  appealOf     ReviewTask?  @relation("ReviewAppeal", fields: [appealOfTaskId], references: [id])
+  appealedBy  ReviewTask[] @relation("ReviewAppeal")
+
+  @@index([status, priority, createdAt], map: "idx_review_queue")
+  @@index([assignedTo, status], map: "idx_review_assignee")
+  @@index([slaDueAt], map: "idx_review_sla")
+  @@map("review_tasks")
+}
+
+model Comment {
+  id           BigInt        @id @default(autoincrement())
+  spotId       BigInt        @map("spot_id")
+  userId       BigInt        @map("user_id")
+  parentId     BigInt?       @map("parent_id")
+  body         String        @db.VarChar(300)
+  status       CommentStatus @default(pending)
+  edited       Boolean       @default(false)
+  editCount    Int           @default(0) @map("edit_count") @db.SmallInt
+  hiddenReason String?       @map("hidden_reason")
+  createdAt    DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt    DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  spot      Spot             @relation(fields: [spotId], references: [id], onDelete: Cascade)
+  user      User             @relation(fields: [userId], references: [id])
+  parent    Comment?         @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies   Comment[]        @relation("CommentReplies")
+  revisions CommentRevision[]
+
+  @@index([spotId, status, createdAt], map: "idx_comments_spot")
+  @@index([userId, createdAt], map: "idx_comments_user")
+  @@map("comments")
+}
+
+model CommentRevision {
+  id        BigInt   @id @default(autoincrement())
+  commentId BigInt   @map("comment_id")
+  body      String   @db.VarChar(300)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  comment Comment @relation(fields: [commentId], references: [id], onDelete: Cascade)
+
+  @@map("comment_revisions")
+}
+
+model SpotConfirmation {
+  id         BigInt   @id @default(autoincrement())
+  spotId     BigInt   @map("spot_id")
+  userId     BigInt   @map("user_id")
+  isAccurate Boolean  @map("is_accurate")
+  note       String?  @db.VarChar(200)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  spot Spot @relation(fields: [spotId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([spotId, userId, createdAt], map: "idx_confirm_spot_user")
+  @@map("spot_confirmations")
+}
+
+model Favorite {
+  userId    BigInt   @map("user_id")
+  spotId    BigInt   @map("spot_id")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  spot Spot @relation(fields: [spotId], references: [id], onDelete: Cascade)
+
+  @@id([userId, spotId])
+  @@map("favorites")
+}
+
+model Report {
+  id           BigInt       @id @default(autoincrement())
+  reporterId   BigInt       @map("reporter_id")
+  targetType   String       @map("target_type") @db.VarChar(16)
+  targetId     BigInt       @map("target_id")
+  reason       String       @db.VarChar(32)
+  detail       String?      @db.VarChar(200)
+  status       ReportStatus @default(open)
+  mergedInto   BigInt?      @map("merged_into")
+  handledBy    BigInt?      @map("handled_by")
+  handleResult String?      @map("handle_result")
+  handledAt    DateTime?    @map("handled_at") @db.Timestamptz(6)
+  slaDueAt     DateTime     @map("sla_due_at") @db.Timestamptz(6)
+  createdAt    DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  reporter User       @relation("ReportReporter", fields: [reporterId], references: [id])
+  handler  User?      @relation("ReportHandler", fields: [handledBy], references: [id])
+  mergedTo Report?    @relation("ReportMerge", fields: [mergedInto], references: [id])
+  merged   Report[]   @relation("ReportMerge")
+
+  @@unique([reporterId, targetType, targetId], map: "report_reporter_id_target_type_target_id_key")
+  @@index([status, slaDueAt], map: "idx_report_queue")
+  @@index([targetType, targetId], map: "idx_report_target")
+  @@map("reports")
+}
+
+model Notification {
+  id        BigInt   @id @default(autoincrement())
+  userId    BigInt   @map("user_id")
+  type      String   @db.VarChar(32)
+  title     String   @db.VarChar(80)
+  body      String?  @db.VarChar(300)
+  payload   Json     @default("{}")
+  readAt    DateTime? @map("read_at") @db.Timestamptz(6)
+  emailSent Boolean  @default(false) @map("email_sent")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt, createdAt], map: "idx_notify_user")
+  @@map("notifications")
+}
+
+model AuditLog {
+  id         BigInt   @id @default(autoincrement())
+  actorId    BigInt?  @map("actor_id")
+  action     String   @db.VarChar(48)
+  targetType String?  @map("target_type") @db.VarChar(24)
+  targetId   BigInt?  @map("target_id")
+  before     Json?
+  after      Json?
+  reason     String?
+  ip         String?  @db.Inet
+  userAgent  String?  @map("user_agent")
+  traceId    String?  @map("trace_id")
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  actor User? @relation(fields: [actorId], references: [id])
+
+  @@index([actorId, createdAt], map: "idx_audit_actor")
+  @@index([targetType, targetId, createdAt], map: "idx_audit_target")
+  @@index([action, createdAt], map: "idx_audit_action")
+  @@map("audit_logs")
+}
