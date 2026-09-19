@@ -184,16 +184,17 @@ export async function purgeOriginalImages(): Promise<{ purged: number }> {
   return { purged };
 }
 
-/** 日常清理：过期令牌、超期通知、失效的审核锁 */
+/** 日常清理：过期令牌、超期通知、失效的审核锁、过期幂等键 */
 export async function cleanup(): Promise<{
   tokens: number;
   notifications: number;
   locks: number;
   unmuted: number;
+  idempotencyKeys: number;
 }> {
   const now = new Date();
 
-  const [tokens, notifications, locks, unmuted] = await Promise.all([
+  const [tokens, notifications, locks, unmuted, idempotencyKeys] = await Promise.all([
     prisma.refreshToken.deleteMany({
       where: { OR: [{ expiresAt: { lt: now } }, { revokedAt: { lt: new Date(now.getTime() - 30 * MS_PER_DAY) } }] },
     }),
@@ -209,6 +210,8 @@ export async function cleanup(): Promise<{
       where: { status: "muted", mutedUntil: { lt: now } },
       data: { status: "active", mutedUntil: null },
     }),
+    // 幂等键 24 小时后失效，统一由清理任务删除
+    prisma.idempotencyKey.deleteMany({ where: { expiresAt: { lt: now } } }),
   ]);
 
   return {
@@ -216,5 +219,6 @@ export async function cleanup(): Promise<{
     notifications: notifications.count,
     locks: locks.count,
     unmuted: unmuted.count,
+    idempotencyKeys: idempotencyKeys.count,
   };
 }

@@ -43,6 +43,7 @@ export interface SpotLocation {
   lat: number;
   lng: number;
   fuzzed: boolean;
+  fuzzEnabled: boolean;
   radiusMeters: number;
   addressText: string | null;
   precise: boolean;
@@ -65,6 +66,8 @@ export interface Spot {
   updatedAt: string;
   favorite?: boolean;
   distanceMeters?: number;
+  /** 作者可见：逐字段最后修改时间（ISO），多端离线合并用 */
+  fieldTimestamps?: Record<string, string>;
 }
 
 export interface Paged<T> {
@@ -72,6 +75,45 @@ export interface Paged<T> {
   page: number;
   pageSize: number;
   total: number;
+}
+
+// ---- 离线多端合并 ----
+
+export interface MergeConflictField {
+  field: string;
+  base: unknown;
+  server: unknown;
+  client: unknown;
+  serverUpdatedAt: string | null;
+  clientUpdatedAt: string | null;
+  winner: "server" | "client";
+}
+
+export interface MergeProposal {
+  merged: Record<string, unknown>;
+  conflicts: MergeConflictField[];
+}
+
+export interface SpotConflictDetails {
+  spotUuid: string;
+  serverUpdatedAt: string;
+  clientBaseUpdatedAt: string | null;
+  proposal: MergeProposal;
+  server?: Record<string, unknown>;
+  serverTimestamps?: Record<string, string>;
+}
+
+/** 条目草稿的载荷形态（与后端 create/update schema 对齐） */
+export interface SpotDraftPayload {
+  categoryCode: string;
+  title: string;
+  description: string;
+  attributes: Record<string, unknown>;
+  lat: number;
+  lng: number;
+  fuzzEnabled: boolean;
+  fuzzRadiusM: number;
+  mediaUuids: string[];
 }
 
 export interface Comment {

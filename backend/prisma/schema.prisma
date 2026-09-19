@@ -122,6 +122,7 @@ model User {
   blurRegions       BlurRegion[]
   categorySchemas   CategorySchema[]
   settings          UserSetting?
+  idempotencyKeys   IdempotencyKey[]
 
   @@index([role, status], map: "idx_users_role_status")
   @@map("users")
@@ -229,6 +230,7 @@ model Spot {
   comments      Comment[]
   confirmations SpotConfirmation[]
   favorites     Favorite[]
+  fieldTimestamps SpotFieldTimestamp[]
 
   @@index([publicLat, publicLng], map: "idx_spots_geo_public")
   @@index([categoryId, status], map: "idx_spots_category")
@@ -470,4 +472,43 @@ model AuditLog {
   @@index([targetType, targetId, createdAt], map: "idx_audit_target")
   @@index([action, createdAt], map: "idx_audit_action")
   @@map("audit_logs")
+}
+
+// 多端离线编辑的字段级时间戳。
+// 冲突不做"整条后写覆盖"，而是逐字段比较最后修改时间；
+// 客户端在合并对话框里确认最终结果后再写入。
+model SpotFieldTimestamp {
+  id        BigInt   @id @default(autoincrement())
+  spotId    BigInt   @map("spot_id")
+  // 字段名：title / description / categoryCode / lat / lng /
+  // fuzzEnabled / fuzzRadiusM / mediaUuids / attributes.<key>
+  field     String   @db.VarChar(64)
+  updatedAt DateTime @map("updated_at") @db.Timestamptz(6)
+
+  spot Spot @relation(fields: [spotId], references: [id], onDelete: Cascade)
+
+  @@unique([spotId, field], map: "spot_field_ts_spot_field_key")
+  @@index([spotId], map: "idx_spot_field_ts_spot")
+  @@map("spot_field_timestamps")
+}
+
+// 幂等键：移动端断网补传会重试同一请求，没有这张表就会产生重复草稿。
+// 24 小时内同用户同键直接返回首次响应（与《项目文档.md》10.1 节约定一致）。
+model IdempotencyKey {
+  id         BigInt   @id @default(autoincrement())
+  userId     BigInt   @map("user_id")
+  key        String   @db.VarChar(64)
+  method     String   @db.VarChar(10)
+  path       String   @db.VarChar(255)
+  requestHash String  @map("request_hash") @db.Char(64)
+  statusCode Int      @map("status_code")
+  response   Json
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  expiresAt  DateTime @map("expires_at") @db.Timestamptz(6)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, key], map: "idempotency_user_key")
+  @@index([expiresAt], map: "idx_idempotency_expires")
+  @@map("idempotency_keys")
 }

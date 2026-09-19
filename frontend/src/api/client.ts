@@ -72,6 +72,14 @@ export interface RequestOptions {
   formData?: FormData;
   query?: Record<string, unknown>;
   skipAuthRetry?: boolean;
+  /** 断网补传去重用，服务端 24 小时内同键返回首次结果 */
+  idempotencyKey?: string;
+}
+
+export function isOfflineError(error: unknown): boolean {
+  return error instanceof TypeError || (error instanceof ApiError === false && error instanceof Error && (
+    /Failed to fetch|NetworkError|Load failed/i.test(error.message)
+  ));
 }
 
 function buildQuery(query?: Record<string, unknown>): string {
@@ -113,6 +121,7 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
   const headers: Record<string, string> = {};
 
   if (accessToken) headers.Authorization = `Bearer ${accessToken}`;
+  if (options.idempotencyKey) headers["Idempotency-Key"] = options.idempotencyKey;
 
   let body: BodyInit | undefined;
   if (options.formData) {
@@ -142,8 +151,10 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
 
 export const api = {
   get: <T>(path: string, query?: Record<string, unknown>) => request<T>(path, { query }),
-  post: <T>(path: string, body?: unknown) => request<T>(path, { method: "POST", body }),
-  patch: <T>(path: string, body?: unknown) => request<T>(path, { method: "PATCH", body }),
+  post: <T>(path: string, body?: unknown, options?: Pick<RequestOptions, "idempotencyKey">) =>
+    request<T>(path, { method: "POST", body, ...options }),
+  patch: <T>(path: string, body?: unknown, options?: Pick<RequestOptions, "idempotencyKey">) =>
+    request<T>(path, { method: "PATCH", body, ...options }),
   put: <T>(path: string, body?: unknown) => request<T>(path, { method: "PUT", body }),
   del: <T>(path: string) => request<T>(path, { method: "DELETE" }),
   upload: <T>(path: string, formData: FormData) => request<T>(path, { method: "POST", formData }),

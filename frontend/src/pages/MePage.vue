@@ -1,15 +1,23 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { useRouter } from "vue-router";
 import { ElMessage, ElMessageBox } from "element-plus";
 import { api } from "@/api/client";
 import type { Paged, Spot } from "@/api/types";
 import { useAuthStore } from "@/stores/auth";
 import { useCatalogStore } from "@/stores/catalog";
+import { useOfflineStore } from "@/offline/store";
 
 const auth = useAuthStore();
 const catalog = useCatalogStore();
+const offline = useOfflineStore();
 const router = useRouter();
+
+/** 尚未与服务端完全一致的本地草稿：从未补传成功，或在补传队列/冲突/出错中 */
+const unsyncedDrafts = computed(() => {
+  const entries = new Map(offline.outbox.map((entry) => [entry.clientId, entry]));
+  return offline.drafts.filter((draft) => !draft.spotUuid || entries.has(draft.clientId));
+});
 
 const tab = ref("contributions");
 const spots = ref<Spot[]>([]);
@@ -141,9 +149,48 @@ async function deleteAccount() {
   }
 }
 
+// ---- 离线草稿 ----
+
+function outboxOf(clientId: string) {
+  return offline.outbox.find((entry) => entry.clientId === clientId);
+}
+
+function outboxStatusLabel(status: string | undefined): string {
+  if (status === "uploading-images") return "正在补传照片…";
+  if (status === "syncing") return "正在同步…";
+  if (status === "conflict") return "多端冲突，待确认合并";
+  if (status === "error") return "补传失败";
+  return offline.online ? "等待补传" : "离线暂存，联网自动补传";
+}
+
+function openDraft(clientId: string, spotUuid: string | null) {
+  if (spotUuid) {
+    void router.push({ name: "spot-edit", params: { uuid: spotUuid }, query: { clientId } });
+  } else {
+    void router.push({ name: "spot-new", query: { clientId } });
+  }
+}
+
+async function discardDraft(clientId: string) {
+  try {
+    await ElMessageBox.confirm("删除后本机上这条未补传的内容与照片都会消失，确定删除吗？", "删除本地草稿", {
+      confirmButtonText: "删除",
+      cancelButtonText: "取消",
+      type: "warning",
+    });
+    await offline.deleteLocalDraft(clientId);
+    ElMessage.success("本地草稿已删除");
+  } catch (error) {
+    if (error instanceof Error && error.message) ElMessage.error(error.message);
+  }
+}
+
 onMounted(async () => {
+  await offline.hydrate();
   await catalog.load().catch(() => undefined);
   await Promise.all([loadContributions(), loadFavorites(), loadSettings()]);
+  // 进入页面且在线时顺手补传一次，用户能立刻看到待补传项的状态变化
+  await offline.drainOutbox().catch(() => undefined);
 });
 </script>
 
@@ -164,7 +211,56 @@ onMounted(async () => {
         </div>
 
         <div v-loading="loading">
-          <el-empty v-if="!loading && spots.length === 0" description="还没有记录，去地图上添加第一个吧" />
+          <!-- 本机离线草稿：未补传 / 补传中 / 待确认合并，集中在最上面，避免用户以为丢了 -->
+          <el-card
+            v-for="draft in unsyncedDrafts"
+            :key="draft.clientId"
+            shadow="never"
+            style="margin-bottom: 10px; border-left: 3px solid var(--el-color-warning)"
+          >
+            <div style="display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap">
+              <div>
+                <el-tag type="warning" size="small">本机草稿</el-tag>
+                <span style="margin-left: 8px; font-weight: 600">{{ draft.payload.title || "（未命名）" }}</span>
+                <div class="muted" style="margin-top: 4px">
+                  {{ draft.payload.categoryCode }} ·
+                  保存于 {{ new Date(draft.updatedAt).toLocaleString("zh-CN") }}
+                </div>
+                <div v-if="outboxOf(draft.clientId)" style="margin-top: 6px">
+                  <el-tag
+                    size="small"
+                    :type="
+                      outboxOf(draft.clientId)?.status === 'conflict' ||
+                      outboxOf(draft.clientId)?.status === 'error'
+                        ? 'danger'
+                        : 'info'
+                    "
+                  >
+                    {{ outboxStatusLabel(outboxOf(draft.clientId)?.status) }}
+                  </el-tag>
+                </div>
+              </div>
+
+              <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-start">
+                <el-button size="small" type="primary" @click="openDraft(draft.clientId, draft.spotUuid)">
+                  继续编辑
+                </el-button>
+                <el-button
+                  v-if="offline.online && outboxOf(draft.clientId)?.status !== 'conflict'"
+                  size="small"
+                  :loading="offline.syncing"
+                  @click="offline.retryNow()"
+                >
+                  立即补传
+                </el-button>
+                <el-button size="small" type="danger" plain @click="discardDraft(draft.clientId)">
+                  删除
+                </el-button>
+              </div>
+            </div>
+          </el-card>
+
+          <el-empty v-if="!loading && spots.length === 0 && unsyncedDrafts.length === 0" description="还没有记录，去地图上添加第一个吧" />
 
           <el-card v-for="spot in spots" :key="spot.uuid" shadow="never" style="margin-bottom: 10px">
             <div style="display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap">

@@ -5,11 +5,13 @@ import { ok } from "../../utils/serialize";
 import { validate } from "../../middleware/validate";
 import { requireActiveWriter, requireAuth, optionalAuth } from "../../middleware/auth";
 import { rateLimit } from "../../middleware/rateLimit";
+import { idempotent } from "../../middleware/idempotency";
 import {
   appealSchema,
   confirmSchema,
   createSpotSchema,
   listSpotsQuerySchema,
+  mergeSpotSchema,
   mySpotsQuerySchema,
   updateSpotSchema,
   uuidParamSchema,
@@ -24,6 +26,7 @@ import {
   listMySpots,
   listRevisions,
   listSpots,
+  mergeSpot,
   setFavorite,
   submitForReview,
   updateSpot,
@@ -62,9 +65,27 @@ spotsRouter.post(
   requireActiveWriter,
   writeLimiter,
   validate({ body: createSpotSchema }),
+  idempotent(),
   asyncHandler(async (req, res) => {
     const spot = await createDraft(req.user!, req.body);
     res.status(201).json(ok(req, spot));
+  }),
+);
+
+/**
+ * 离线多端冲突合并：客户端按字段时间戳生成合并方案、用户确认最终结果后，
+ * 带着确认后的内容与基线版本调用本接口入库。
+ */
+spotsRouter.post(
+  "/spots/:uuid/merge",
+  requireAuth,
+  requireActiveWriter,
+  writeLimiter,
+  validate({ params: uuidParamSchema, body: mergeSpotSchema }),
+  idempotent(),
+  asyncHandler(async (req, res) => {
+    const spot = await mergeSpot(req.params.uuid, req.user!, req.body);
+    res.json(ok(req, spot));
   }),
 );
 

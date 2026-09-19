@@ -20,7 +20,17 @@ import { isModerator } from "../../types/auth";
 import { notify } from "../../services/notify";
 import { adjustCredit, CREDIT_DELTAS } from "../../services/moderation/credit";
 import { logger } from "../../utils/logger";
-import type { CreateSpotInput, ListSpotsQuery, UpdateSpotInput } from "./schemas";
+import type { CreateSpotInput, ListSpotsQuery, MergeSpotInput, UpdateSpotInput } from "./schemas";
+import {
+  buildMergeProposal,
+  currentServerFields,
+  flattenSpotFields,
+  SPOT_SCALAR_FIELDS,
+  timestampsFromRows,
+  unflattenSpotFields,
+  type FieldMap,
+  type TimestampMap,
+} from "./merge";
 
 const MS_PER_DAY = 86400000;
 
@@ -242,16 +252,79 @@ export async function getSpotByUuid(uuid: string, viewer?: AuthUser) {
     ? (await prisma.favorite.count({ where: { userId: viewer.id, spotId: spot.id } })) > 0
     : undefined;
 
-  return serializeSpot(
+  // 字段级时间戳只对作者/审核员返回，供离线多端合并使用；公开响应不带
+  const fieldTimestampRows = privileged
+    ? await prisma.spotFieldTimestamp.findMany({ where: { spotId: spot.id } })
+    : [];
+
+  const payload = serializeSpot(
     {
       ...toSpotLike(spot, confirmed.get(spot.id.toString()) ?? null),
       media,
     },
     { includeExact: privileged, favorite },
   );
+
+  if (privileged) {
+    payload.fieldTimestamps = Object.fromEntries(
+      fieldTimestampRows.map((row) => [row.field, row.updatedAt.toISOString()]),
+    );
+  }
+
+  return payload;
 }
 
 // ------------------------------------------------------------------ 写入
+
+/**
+ * 同步字段级时间戳。客户端可以在 fieldTimestamps 里带上每字段的本地修改时间；
+ * 未携带的字段默认用服务端当前时间（在线编辑场景）。
+ * attributes 的属性字段键形如 attributes.has_backrest。
+ */
+async function syncFieldTimestamps(
+  spotId: bigint,
+  fields: string[],
+  clientTimestamps: TimestampMap | undefined,
+  fallback: Date = new Date(),
+): Promise<void> {
+  if (fields.length === 0) return;
+
+  await prisma.$transaction(
+    fields.map((field) => {
+      const clientTime = clientTimestamps?.[field];
+      const updatedAt = clientTime ? new Date(clientTime) : fallback;
+      // 离线补传时本地时间可能早于库里已有的时间戳（例如另一台设备更新），
+      // 用 greatest 保证时间戳单调不减——但能否覆盖值由上层合并逻辑决定。
+      return prisma.$executeRaw`
+        INSERT INTO "spot_field_timestamps" ("spot_id", "field", "updated_at")
+        VALUES (${spotId}, ${field}, ${updatedAt})
+        ON CONFLICT ("spot_id", "field")
+        DO UPDATE SET "updated_at" = GREATEST("spot_field_timestamps"."updated_at", EXCLUDED."updated_at")
+      `;
+    }),
+  );
+}
+
+function touchedFields(input: {
+  categoryCode?: unknown;
+  title?: unknown;
+  description?: unknown;
+  attributes?: Record<string, unknown>;
+  lat?: unknown;
+  lng?: unknown;
+  fuzzEnabled?: unknown;
+  fuzzRadiusM?: unknown;
+  mediaUuids?: unknown;
+}): string[] {
+  const fields: string[] = [];
+  for (const field of SPOT_SCALAR_FIELDS) {
+    if (input[field] !== undefined) fields.push(field);
+  }
+  if (input.attributes !== undefined) {
+    for (const key of Object.keys(input.attributes)) fields.push(`attributes.${key}`);
+  }
+  return fields;
+}
 
 async function attachMedia(spotId: bigint | null, ownerId: bigint, mediaUuids: string[]) {
   if (mediaUuids.length === 0) return;
@@ -306,20 +379,33 @@ export async function createDraft(user: AuthUser, input: CreateSpotInput) {
       fuzzEnabled: input.fuzzEnabled,
       fuzzRadiusM: input.fuzzEnabled ? input.fuzzRadiusM : 0,
     },
-    select: { id: true, uuid: true },
+    select: { id: true, uuid: true, createdAt: true },
   });
 
   if (input.mediaUuids.length > 0) {
     await attachMedia(spot.id, user.id, input.mediaUuids);
   }
 
+  // 离线创建的草稿可能带着本地字段时间；在线创建则全部记为当前时间
+  const allFields = [
+    ...SPOT_SCALAR_FIELDS,
+    ...Object.keys(input.attributes).map((key) => `attributes.${key}`),
+  ];
+  await syncFieldTimestamps(spot.id, allFields, input.fieldTimestamps, spot.createdAt);
+
   return getSpotByUuid(spot.uuid, user);
 }
 
 const EDITABLE_STATUSES: SpotStatus[] = ["draft", "changes_requested", "auto_rejected", "rejected"];
 
-export async function updateSpot(uuid: string, user: AuthUser, input: UpdateSpotInput) {
-  const spot = await prisma.spot.findUnique({ where: { uuid } });
+async function loadEditableSpot(uuid: string, user: AuthUser) {
+  const spot = await prisma.spot.findUnique({
+    where: { uuid },
+    include: {
+      category: { select: { code: true } },
+      media: { select: { uuid: true } },
+    },
+  });
   if (!spot || spot.deletedAt) throw AppError.notFound("该地点不存在");
   if (spot.ownerId !== user.id && !isModerator(user)) {
     throw AppError.forbidden("你只能编辑自己提交的内容");
@@ -330,46 +416,226 @@ export async function updateSpot(uuid: string, user: AuthUser, input: UpdateSpot
       `当前状态（${spot.status}）不能编辑，请先撤回或等待审核结果`,
     );
   }
+  return spot;
+}
 
+/** 加载条目用于合并：当前字段值 + 字段时间戳 */
+async function loadMergeContext(spotId: bigint) {
+  const [spot, timestampRows, mediaUuids] = await Promise.all([
+    prisma.spot.findUnique({
+      where: { id: spotId },
+      include: { category: { select: { code: true } } },
+    }),
+    prisma.spotFieldTimestamp.findMany({ where: { spotId } }),
+    prisma.mediaAsset.findMany({ where: { spotId }, select: { uuid: true }, orderBy: { id: "asc" } }),
+  ]);
+  if (!spot) throw AppError.notFound("该地点不存在");
+
+  const serverFields = currentServerFields({
+    categoryCode: spot.category.code,
+    title: spot.title,
+    description: spot.description,
+    attributes: spot.attributes,
+    exactLat: spot.exactLat,
+    exactLng: spot.exactLng,
+    fuzzEnabled: spot.fuzzEnabled,
+    fuzzRadiusM: spot.fuzzRadiusM,
+    mediaUuids: mediaUuids.map((asset) => asset.uuid),
+  });
+
+  return { spot, serverFields, serverTimestamps: timestampsFromRows(timestampRows) };
+}
+
+/**
+ * 离线补传发现服务端已被另一台设备修改时，构造 409 响应：
+ * 给出共同基线、服务端当前值、本地值和按时间戳预选的合并方案，
+ * 前端据此弹出合并对话框，用户确认最终结果后调用 /merge 入库。
+ */
+async function buildConflict(
+  spot: { id: bigint; uuid: string; updatedAt: Date },
+  input: UpdateSpotInput,
+): Promise<never> {
+  const { serverFields, serverTimestamps } = await loadMergeContext(spot.id);
+
+  const clientFields = flattenSpotFields({
+    ...input,
+    attributes: input.attributes,
+    mediaUuids: input.mediaUuids,
+  });
+  const clientTimestamps: TimestampMap = input.fieldTimestamps ?? {};
+
+  // 客户端补传时只带改动字段，未带字段表示本机没动：
+  // 用服务端现值补齐，避免合并时把这些字段误判成"本机改成了空"。
+  const clientComplete: FieldMap = { ...serverFields, ...clientFields };
+
+  // 本地没有共同基线快照时，以服务端当前版本为基线：
+  // 与服务端相同的字段不算冲突，只有本地确实改动的字段才进合并对话框。
+  const proposal = buildMergeProposal({
+    base: serverFields,
+    server: serverFields,
+    client: clientComplete,
+    serverTimestamps,
+    clientTimestamps,
+    baseUpdatedAt: input.baseUpdatedAt ?? spot.updatedAt.toISOString(),
+  });
+
+  throw new AppError(409, ERROR_CODES.SPOT_VERSION_CONFLICT, "这条记录在另一台设备上被修改过，请确认如何合并", {
+    spotUuid: spot.uuid,
+    serverUpdatedAt: spot.updatedAt.toISOString(),
+    clientBaseUpdatedAt: input.baseUpdatedAt ?? null,
+    proposal,
+  });
+}
+
+/** 把字段载荷写入 spot 行并同步媒体关联与字段时间戳 */
+async function applySpotFields(
+  spot: { id: bigint; ownerId: bigint; status: SpotStatus },
+  fields: SpotFieldInputLike,
+  options: {
+    fieldTimestamps?: TimestampMap;
+    asModerator: boolean;
+    /**
+     * attributes 的处理方式：
+     * - "replace"（普通 PATCH）：整个属性对象覆盖；
+     * - "merge-keys"（合并确认）：只覆盖载荷里出现的属性 key，
+     *   其余属性保留服务端现值，避免用户确认单个属性时把别的属性冲掉。
+     */
+    attributesMode?: "replace" | "merge-keys";
+  },
+): Promise<void> {
   const data: Prisma.SpotUpdateInput = {};
 
-  if (input.title !== undefined) data.title = input.title;
-  if (input.description !== undefined) data.description = input.description || null;
-  if (input.title !== undefined || input.description !== undefined) {
-    assertNoBlockedContent(input.title ?? spot.title, input.description ?? spot.description);
+  if (fields.title !== undefined) data.title = fields.title;
+  if (fields.description !== undefined) data.description = fields.description || null;
+  if (fields.title !== undefined || fields.description !== undefined) {
+    assertNoBlockedContent(fields.title ?? undefined, fields.description ?? undefined);
   }
 
-  if (input.categoryCode !== undefined) {
-    const category = await requireCategoryByCode(input.categoryCode);
+  if (fields.categoryCode !== undefined) {
+    const category = await requireCategoryByCode(fields.categoryCode);
     data.category = { connect: { id: category.id } };
   }
-  if (input.attributes !== undefined) data.attributes = toJsonValue(input.attributes);
-  if (input.lat !== undefined) data.exactLat = input.lat;
-  if (input.lng !== undefined) data.exactLng = input.lng;
-  if (input.fuzzEnabled !== undefined) data.fuzzEnabled = input.fuzzEnabled;
-  if (input.fuzzRadiusM !== undefined) {
-    data.fuzzRadiusM = input.fuzzEnabled === false ? 0 : input.fuzzRadiusM;
+  if (fields.attributes !== undefined) {
+    if (options.attributesMode === "merge-keys") {
+      // 只更新确认字段里出现的属性 key；Prisma 的 Json 过滤做不到局部合并，
+      // 在事务里读当前值再整体写回。
+      const current = await prisma.spot.findUniqueOrThrow({
+        where: { id: spot.id },
+        select: { attributes: true },
+      });
+      const mergedAttributes = {
+        ...((current.attributes as Record<string, unknown> | null) ?? {}),
+        ...fields.attributes,
+      };
+      data.attributes = toJsonValue(mergedAttributes);
+    } else {
+      data.attributes = toJsonValue(fields.attributes);
+    }
   }
-
-  if (input.lat !== undefined && input.lng !== undefined && !isValidLatLng(input.lat, input.lng)) {
+  if (fields.lat !== undefined) data.exactLat = fields.lat;
+  if (fields.lng !== undefined) data.exactLng = fields.lng;
+  if (fields.fuzzEnabled !== undefined) data.fuzzEnabled = fields.fuzzEnabled;
+  if (fields.fuzzRadiusM !== undefined) {
+    data.fuzzRadiusM = fields.fuzzEnabled === false ? 0 : fields.fuzzRadiusM;
+  }
+  if (fields.lat !== undefined && fields.lng !== undefined && !isValidLatLng(fields.lat, fields.lng)) {
     throw AppError.badRequest("坐标不合法");
   }
 
   // 已发布的条目被修改后需要重新审核，直接回到草稿状态
-  if (spot.status === "published" && !isModerator(user)) {
+  if (spot.status === "published" && !options.asModerator) {
     data.status = "draft";
     data.publishedAt = null;
     data.publicLat = null;
     data.publicLng = null;
   }
 
-  await prisma.spot.update({ where: { id: spot.id }, data });
-
-  if (input.mediaUuids !== undefined) {
-    await prisma.mediaAsset.updateMany({ where: { spotId: spot.id }, data: { spotId: null } });
-    await attachMedia(spot.id, spot.ownerId, input.mediaUuids);
+  if (Object.keys(data).length > 0) {
+    await prisma.spot.update({ where: { id: spot.id }, data });
   }
 
+  if (fields.mediaUuids !== undefined) {
+    await prisma.mediaAsset.updateMany({ where: { spotId: spot.id }, data: { spotId: null } });
+    await attachMedia(spot.id, spot.ownerId, fields.mediaUuids);
+  }
+
+  await syncFieldTimestamps(
+    spot.id,
+    Object.keys(flattenSpotFields(fields)),
+    options.fieldTimestamps,
+  );
+}
+
+type SpotFieldInputLike = {
+  categoryCode?: string;
+  title?: string;
+  description?: string | null;
+  attributes?: Record<string, unknown> | null;
+  lat?: number;
+  lng?: number;
+  fuzzEnabled?: boolean;
+  fuzzRadiusM?: number;
+  mediaUuids?: string[];
+};
+
+export async function updateSpot(uuid: string, user: AuthUser, input: UpdateSpotInput) {
+  const spot = await loadEditableSpot(uuid, user);
+
+  // 乐观并发：离线补传带的基线版本落后于服务端 → 不做覆盖，走字段级合并。
+  // 在线编辑（不带 baseUpdatedAt）保持原有"直接保存"语义。
+  if (input.baseUpdatedAt) {
+    const baseTime = new Date(input.baseUpdatedAt).getTime();
+    // 数据库时间戳精度高于毫秒，给 1ms 容差，避免正常保存被误判为冲突
+    if (Math.abs(spot.updatedAt.getTime() - baseTime) > 1) {
+      await buildConflict(spot, input);
+    }
+  }
+
+  await applySpotFields(spot, input, {
+    fieldTimestamps: input.fieldTimestamps,
+    asModerator: isModerator(user) && spot.ownerId !== user.id,
+  });
+
+  return getSpotByUuid(uuid, user);
+}
+
+/**
+ * 用户在合并对话框确认后的最终入库：
+ * baseUpdatedAt 仍然必须匹配当前版本，否则说明在用户确认期间又有一端写入，
+ * 再次返回 409，让用户基于最新状态重新确认——不悄悄覆盖。
+ */
+export async function mergeSpot(uuid: string, user: AuthUser, input: MergeSpotInput) {
+  const spot = await loadEditableSpot(uuid, user);
+
+  if (Math.abs(spot.updatedAt.getTime() - new Date(input.baseUpdatedAt).getTime()) > 1) {
+    const { serverFields, serverTimestamps } = await loadMergeContext(spot.id);
+    throw new AppError(409, ERROR_CODES.SPOT_VERSION_CONFLICT, "确认合并期间内容又发生了变化，请重新确认", {
+      spotUuid: spot.uuid,
+      serverUpdatedAt: spot.updatedAt.toISOString(),
+      server: serverFields,
+      serverTimestamps,
+    });
+  }
+
+  const fields = unflattenSpotFields(input.fields as FieldMap);
+  if (fields.mediaUuids !== undefined && fields.mediaUuids.length > 6) {
+    throw AppError.badRequest("最多上传 6 张图片");
+  }
+  assertNoBlockedContent(fields.title, fields.description ?? undefined);
+
+  // 用户确认后的字段时间一律以"确认时刻"为准，合并结果即最新真相
+  const confirmedAt = new Date().toISOString();
+  const fieldTimestamps: TimestampMap = Object.fromEntries(
+    Object.keys(input.fields).map((field) => [field, input.fieldTimestamps[field] ?? confirmedAt]),
+  );
+
+  await applySpotFields(spot, fields, {
+    fieldTimestamps,
+    asModerator: isModerator(user) && spot.ownerId !== user.id,
+    attributesMode: "merge-keys",
+  });
+
+  logger.info({ spotUuid: uuid, fields: Object.keys(input.fields) }, "多端冲突合并已由用户确认入库");
   return getSpotByUuid(uuid, user);
 }
 

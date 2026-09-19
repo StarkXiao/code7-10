@@ -105,6 +105,9 @@ export function serializeSpot(spot: SpotLike, options: SpotSerializeOptions = {}
       lat,
       lng,
       fuzzed: !options.includeExact && spot.fuzzEnabled && spot.fuzzRadiusM > 0,
+      // 作者视角下 fuzzed 恒为 false，开关本身需要单独回传，
+      // 否则多端离线合并时无法还原用户是否勾选了"对外模糊显示位置"
+      fuzzEnabled: spot.fuzzEnabled,
       radiusMeters: spot.fuzzRadiusM,
       addressText: spot.addressText,
       precise: Boolean(options.includeExact),
