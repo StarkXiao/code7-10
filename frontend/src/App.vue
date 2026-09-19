@@ -5,10 +5,14 @@ import { ElMessage } from "element-plus";
 import { useAuthStore } from "@/stores/auth";
 import { useCatalogStore } from "@/stores/catalog";
 import { useNotificationStore } from "@/stores/notifications";
+import { useDraftStore } from "@/stores/drafts";
+import OfflineBar from "@/components/OfflineBar.vue";
+import ConflictResolver from "@/components/ConflictResolver.vue";
 
 const auth = useAuthStore();
 const catalog = useCatalogStore();
 const notifications = useNotificationStore();
+const drafts = useDraftStore();
 const route = useRoute();
 const router = useRouter();
 
@@ -16,6 +20,7 @@ const isMapPage = computed(() => route.name === "map");
 
 onMounted(async () => {
   await catalog.load().catch(() => undefined);
+  await drafts.refresh().catch(() => undefined);
 
   if (auth.isLoggedIn) {
     await notifications.load().catch(() => undefined);
@@ -87,8 +92,12 @@ async function goNotifications() {
     </header>
 
     <main class="app-main" :class="{ 'app-main--flush': isMapPage }">
+      <OfflineBar />
       <RouterView />
     </main>
+
+    <!-- 多端冲突合并的确认弹窗挂在根部，任何页面补传撞冲突都能弹 -->
+    <ConflictResolver />
   </div>
 </template>
 

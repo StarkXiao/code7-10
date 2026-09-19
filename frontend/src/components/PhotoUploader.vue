@@ -1,16 +1,27 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from "vue";
+import { computed, onBeforeUnmount, ref, watch } from "vue";
 import { ElMessage } from "element-plus";
-import { api, mediaUrl } from "@/api/client";
+import { api, ApiError, mediaUrl } from "@/api/client";
+import { isOnline } from "@/offline/network";
 import type { MediaStatus, UploadedAsset } from "@/api/types";
 
-const props = defineProps<{
-  modelValue: string[];
-  max?: number;
-}>();
+const props = withDefaults(
+  defineProps<{
+    modelValue: string[];
+    max?: number;
+    /** 断网期间选取、待联网补传的图片 */
+    pendingLocalIds?: string[];
+    disabled?: boolean;
+  }>(),
+  { max: 6, pendingLocalIds: () => [], disabled: false },
+);
 
 const emit = defineEmits<{
   (event: "update:modelValue", value: string[]): void;
+  (event: "update:pendingLocalIds", value: string[]): void;
+  /** 用户选了文件；在线由组件自行上传，离线交给父组件存入 IndexedDB */
+  (event: "pending-file", payload: { file: File }): void;
+  (event: "remove-pending", localId: string): void;
 }>();
 
 interface TrackedAsset extends UploadedAsset {
@@ -20,12 +31,15 @@ interface TrackedAsset extends UploadedAsset {
 }
 
 const assets = ref<TrackedAsset[]>([]);
+const pendingPreview = ref<Array<{ localId: string; url: string; name: string }>>([]);
 const uploading = ref(false);
 const polling = new Set<string>();
 let pollTimer: number | undefined;
+const objectUrls: string[] = [];
 
-const limit = computed(() => props.max ?? 6);
-const canAdd = computed(() => assets.value.length < limit.value);
+const limit = computed(() => props.max);
+const usedCount = computed(() => assets.value.length + pendingPreview.value.length);
+const canAdd = computed(() => usedCount.value < limit.value);
 
 // 隐私状态直接展示给贡献者，让他知道图片还要过一道隐私处理
 const STATUS_TEXT: Record<string, string> = {
@@ -51,14 +65,21 @@ async function handleFiles(event: Event) {
   input.value = "";
   if (files.length === 0) return;
 
-  const room = limit.value - assets.value.length;
+  const room = limit.value - usedCount.value;
   if (room <= 0) {
     ElMessage.warning(`最多上传 ${limit.value} 张图片`);
     return;
   }
+  const picked = files.slice(0, room);
+
+  if (!isOnline.value) {
+    // 离线：只把文件交给父组件入 IndexedDB，预览由父组件回填 localId 后生成
+    for (const file of picked) emit("pending-file", { file });
+    return;
+  }
 
   const formData = new FormData();
-  for (const file of files.slice(0, room)) {
+  for (const file of picked) {
     formData.append("files", file);
   }
 
@@ -85,7 +106,13 @@ async function handleFiles(event: Event) {
 
     syncModel();
   } catch (error) {
-    ElMessage.error((error as Error).message);
+    // 请求级失败基本就是断网/弱网：降级成本地暂存，不让用户白选一遍
+    if (!isOnline.value || !(error instanceof ApiError)) {
+      for (const file of picked) emit("pending-file", { file });
+      ElMessage.info("当前网络不可用，照片已暂存在本机，联网后自动补传");
+    } else {
+      ElMessage.error(error.message);
+    }
   } finally {
     uploading.value = false;
   }
@@ -135,6 +162,28 @@ function remove(uuid: string) {
   syncModel();
 }
 
+function removePending(localId: string) {
+  const target = pendingPreview.value.find((item) => item.localId === localId);
+  if (target) URL.revokeObjectURL(target.url);
+  pendingPreview.value = pendingPreview.value.filter((item) => item.localId !== localId);
+  emit(
+    "update:pendingLocalIds",
+    pendingPreview.value.map((item) => item.localId),
+  );
+  emit("remove-pending", localId);
+}
+
+// 父组件（离线暂存完成）回填一张待传图片的预览
+function addPendingPreview(localId: string, blob: Blob, name: string) {
+  const url = URL.createObjectURL(blob);
+  objectUrls.push(url);
+  pendingPreview.value = [...pendingPreview.value, { localId, url, name }];
+  emit(
+    "update:pendingLocalIds",
+    pendingPreview.value.map((item) => item.localId),
+  );
+}
+
 defineExpose({
   setExisting(next: Array<{ uuid: string; variants: Record<string, string>; privacyStatus: string; variantVersion: number; width: number; height: number }>) {
     assets.value = next.map((item) => ({
@@ -150,10 +199,25 @@ defineExpose({
     }));
     syncModel();
   },
+  addPendingPreview,
 });
+
+// pendingLocalIds 由父组件完整控制时，清理失效的预览
+watch(
+  () => props.pendingLocalIds,
+  (ids) => {
+    for (const item of pendingPreview.value) {
+      if (!ids.includes(item.localId)) {
+        URL.revokeObjectURL(item.url);
+      }
+    }
+    pendingPreview.value = pendingPreview.value.filter((item) => ids.includes(item.localId));
+  },
+);
 
 onBeforeUnmount(() => {
   if (pollTimer !== undefined) window.clearInterval(pollTimer);
+  for (const url of objectUrls) URL.revokeObjectURL(url);
 });
 </script>
 
@@ -175,7 +239,22 @@ onBeforeUnmount(() => {
         <span class="photo-thumb__status">{{ asset.statusText }}</span>
       </div>
 
-      <label v-if="canAdd" class="photo-add">
+      <div v-for="item in pendingPreview" :key="item.localId" class="photo-thumb photo-thumb--pending">
+        <img :src="item.url" :alt="`待上传图片 ${item.name}`" />
+        <el-button
+          class="photo-thumb__remove"
+          size="small"
+          circle
+          type="warning"
+          aria-label="移除这张待传图片"
+          @click="removePending(item.localId)"
+        >
+          <el-icon><Close /></el-icon>
+        </el-button>
+        <span class="photo-thumb__status">待联网补传</span>
+      </div>
+
+      <label v-if="canAdd && !disabled" class="photo-add">
         <input
           type="file"
           accept="image/jpeg,image/png,image/webp,image/gif,image/tiff,image/avif"
@@ -189,12 +268,17 @@ onBeforeUnmount(() => {
     </div>
 
     <p class="muted" style="margin: 8px 0 0">
-      最多 {{ limit }} 张。上传时会自动清除照片里的位置等元数据，人脸、车牌等区域由审核员确认后打码。
+      最多 {{ limit }} 张。上传时会自动清除照片里的位置等元数据；断网时选的照片会暂存在本机，联网后自动补传。
     </p>
   </div>
 </template>
 
 <style scoped>
+.photo-thumb--pending {
+  outline: 2px dashed var(--color-warning, #e6a23c);
+  outline-offset: -2px;
+}
+
 .photo-add {
   width: 104px;
   height: 104px;

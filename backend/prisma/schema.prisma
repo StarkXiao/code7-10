@@ -122,6 +122,7 @@ model User {
   blurRegions       BlurRegion[]
   categorySchemas   CategorySchema[]
   settings          UserSetting?
+  clientSpotCreates ClientSpotCreate[]
 
   @@index([role, status], map: "idx_users_role_status")
   @@map("users")
@@ -229,6 +230,7 @@ model Spot {
   comments      Comment[]
   confirmations SpotConfirmation[]
   favorites     Favorite[]
+  clientCreates ClientSpotCreate[]
 
   @@index([publicLat, publicLng], map: "idx_spots_geo_public")
   @@index([categoryId, status], map: "idx_spots_category")
@@ -448,6 +450,24 @@ model Notification {
 
   @@index([userId, readAt, createdAt], map: "idx_notify_user")
   @@map("notifications")
+}
+
+// 断网补传的幂等键：移动端在弱网下重试 POST /spots 时可能重复到达，
+// 靠 (ownerId, clientKey) 去重，保证同一草稿只落库一次。
+model ClientSpotCreate {
+  id        BigInt   @id @default(autoincrement())
+  ownerId   BigInt   @map("owner_id")
+  clientKey String   @map("client_key") @db.VarChar(64)
+  spotId    BigInt   @map("spot_id")
+  spotUuid  String   @map("spot_uuid") @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  owner User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  spot  Spot @relation(fields: [spotId], references: [id], onDelete: Cascade)
+
+  @@unique([ownerId, clientKey], map: "client_spot_creates_owner_key")
+  @@index([createdAt], map: "idx_client_spot_creates_created")
+  @@map("client_spot_creates")
 }
 
 model AuditLog {

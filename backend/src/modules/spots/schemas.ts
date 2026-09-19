@@ -17,9 +17,24 @@ export const createSpotSchema = z.object({
   fuzzEnabled: z.boolean().default(true),
   fuzzRadiusM: z.number().int().min(0).max(500).default(50),
   mediaUuids: z.array(z.string().uuid("图片标识不正确")).max(6, "最多 6 张图片").default([]),
+  // 移动端离线补传的幂等键：同一键的重复请求直接返回首次创建的草稿，
+  // 避免弱网重试导致同一条记录落库两次。
+  clientKey: z.string().trim().min(8).max(64).regex(/^[A-Za-z0-9_-]+$/, "客户端标识格式不正确").optional(),
 });
 
-export const updateSpotSchema = createSpotSchema.partial();
+// 乐观锁：PATCH 带上次读到的 updatedAt（ISO 时间）。
+// 编辑期间条目被其他设备改过则返回 409，由前端按字段时间戳合并后让用户确认。
+const baseUpdatedAtSchema = z
+  .string()
+  .datetime({ offset: true, message: "版本时间格式不正确" })
+  .optional();
+
+export const updateSpotSchema = createSpotSchema
+  .partial()
+  .extend({ baseUpdatedAt: baseUpdatedAtSchema });
+
+export type CreateSpotInput = z.infer<typeof createSpotSchema>;
+export type UpdateSpotInput = z.infer<typeof updateSpotSchema>;
 
 export const listSpotsQuerySchema = z.object({
   bbox: z.string().optional(),
@@ -67,7 +82,5 @@ export const uuidParamSchema = z.object({
   uuid: z.string().uuid("条目标识不正确"),
 });
 
-export type CreateSpotInput = z.infer<typeof createSpotSchema>;
-export type UpdateSpotInput = z.infer<typeof updateSpotSchema>;
 export type ListSpotsQuery = z.infer<typeof listSpotsQuerySchema>;
 export type ConfirmInput = z.infer<typeof confirmSchema>;

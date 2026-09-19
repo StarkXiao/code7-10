@@ -6,9 +6,13 @@ import { api } from "@/api/client";
 import type { Paged, Spot } from "@/api/types";
 import { useAuthStore } from "@/stores/auth";
 import { useCatalogStore } from "@/stores/catalog";
+import { useDraftStore } from "@/stores/drafts";
+import { syncQueue } from "@/offline/queue";
+import { isOnline } from "@/offline/network";
 
 const auth = useAuthStore();
 const catalog = useCatalogStore();
+const draftStore = useDraftStore();
 const router = useRouter();
 
 const tab = ref("contributions");
@@ -32,7 +36,60 @@ const STATUS_LABEL: Record<string, string> = {
   rejected_final: "终审未通过",
   hidden: "已下架",
   archived: "已归档",
+  local: "本机保存",
+  queued: "等待补传",
+  syncing: "补传中",
+  conflict: "多端冲突待确认",
+  error: "补传失败",
+  synced: "已同步",
 };
+
+const DRAFT_STATUS_TYPE: Record<string, "info" | "warning" | "danger" | "primary"> = {
+  local: "info",
+  queued: "info",
+  syncing: "primary",
+  conflict: "danger",
+  error: "warning",
+};
+
+function draftCategoryName(code: string): string {
+  return catalog.byCode(code)?.name ?? code;
+}
+
+function openDraft(key: string, spotUuid: string | null): void {
+  if (spotUuid) {
+    void router.push({ name: "spot-edit", params: { uuid: spotUuid } });
+  } else {
+    // 新建类草稿仍走 /spots/new，编辑页挂载时会按 key 恢复
+    void router.push({ name: "spot-new", query: { draft: key } });
+  }
+}
+
+async function retryDraft(key: string): Promise<void> {
+  if (!isOnline.value) {
+    ElMessage.info("当前离线，联网后会自动补传");
+    return;
+  }
+  const outcome = await syncQueue.syncOne(key);
+  if (outcome?.status === "synced") {
+    ElMessage.success("补传成功");
+    await Promise.all([draftStore.refresh(), loadContributions()]);
+  } else if (outcome?.status === "conflict") {
+    ElMessage.warning("存在多端冲突，请在弹窗里确认最终结果");
+  } else {
+    ElMessage.error(outcome?.message ?? "补传失败");
+  }
+}
+
+async function discardDraft(key: string): Promise<void> {
+  await ElMessageBox.confirm("放弃这条本机草稿？该操作只影响这台设备上未同步的内容。", "放弃草稿", {
+    confirmButtonText: "放弃",
+    cancelButtonText: "取消",
+    type: "warning",
+  });
+  await draftStore.remove(key);
+  ElMessage.success("已删除本机草稿");
+}
 
 function statusTagType(status: string): "success" | "warning" | "danger" | "info" {
   if (status === "published") return "success";
@@ -143,6 +200,7 @@ async function deleteAccount() {
 
 onMounted(async () => {
   await catalog.load().catch(() => undefined);
+  await draftStore.refresh().catch(() => undefined);
   await Promise.all([loadContributions(), loadFavorites(), loadSettings()]);
 });
 </script>
@@ -162,6 +220,52 @@ onMounted(async () => {
             信用分 {{ auth.user?.creditScore }} · 已通过 {{ auth.user?.approvedCount }} 条
           </span>
         </div>
+
+        <el-card
+          v-if="draftStore.drafts.length"
+          shadow="never"
+          style="margin-bottom: 12px; border-color: var(--color-primary)"
+        >
+          <template #header>
+            <span>本机草稿与补传（{{ draftStore.drafts.length }}）</span>
+          </template>
+          <el-card
+            v-for="draft in draftStore.drafts"
+            :key="draft.key"
+            shadow="never"
+            style="margin-bottom: 8px"
+            body-style="padding: 10px 12px"
+          >
+            <div style="display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; align-items: center">
+              <div>
+                <el-tag size="small" :type="DRAFT_STATUS_TYPE[draft.status] ?? 'info'">
+                  {{ STATUS_LABEL[draft.status] ?? draft.status }}
+                </el-tag>
+                <span style="margin-left: 8px; font-weight: 600">
+                  {{ draft.title || "（未命名草稿）" }}
+                </span>
+                <div class="muted" style="margin-top: 4px; font-size: 12px">
+                  {{ draftCategoryName(draft.categoryCode) }} ·
+                  {{ new Date(draft.updatedAt).toLocaleString("zh-CN") }}
+                  <template v-if="draft.pendingPhotos.length"> · {{ draft.pendingPhotos.length }} 张照片待传</template>
+                  <template v-if="draft.lastError"> · {{ draft.lastError }}</template>
+                </div>
+              </div>
+              <div style="display: flex; gap: 6px; flex-wrap: wrap">
+                <el-button size="small" @click="openDraft(draft.key, draft.spotUuid)">继续编辑</el-button>
+                <el-button
+                  v-if="draft.status === 'error' || draft.status === 'queued' || draft.status === 'local'"
+                  size="small"
+                  type="primary"
+                  @click="retryDraft(draft.key)"
+                >
+                  立即补传
+                </el-button>
+                <el-button size="small" type="danger" plain @click="discardDraft(draft.key)">放弃</el-button>
+              </div>
+            </div>
+          </el-card>
+        </el-card>
 
         <div v-loading="loading">
           <el-empty v-if="!loading && spots.length === 0" description="还没有记录，去地图上添加第一个吧" />

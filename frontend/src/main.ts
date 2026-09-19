@@ -17,6 +17,8 @@ import markerShadow from "leaflet/dist/images/marker-shadow.png";
 
 import App from "@/App.vue";
 import router from "@/router";
+import { installNetworkEvents } from "@/offline/network";
+import { startSyncQueue } from "@/offline/queue";
 
 // Leaflet 默认图标走的是打包器处理过的资源路径，
 // 不显式设置的话生产构建后标记会变成裂图。
@@ -35,4 +37,9 @@ for (const [name, component] of Object.entries(ElementPlusIconsVue)) {
 app.use(createPinia());
 app.use(router);
 app.use(ElementPlus, { locale: zhCn });
+
+// 离线能力：监听网络/前后台切换，并在启动时尝试补传本地草稿
+installNetworkEvents();
+startSyncQueue();
+
 app.mount("#app");

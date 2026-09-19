@@ -1,4 +1,4 @@
-import type { Prisma, SpotStatus } from "@prisma/client";
+import { Prisma, type SpotStatus } from "@prisma/client";
 import { env } from "../../config/env";
 import {
   CONFIRMATION_COOLDOWN_MS,
@@ -274,6 +274,18 @@ async function attachMedia(spotId: bigint | null, ownerId: bigint, mediaUuids: s
 }
 
 export async function createDraft(user: AuthUser, input: CreateSpotInput) {
+  // 断网补传重试：clientKey 已见过就直接返回首次创建的草稿，
+  // 同一条记录绝不因为弱网重试而落库两次。
+  if (input.clientKey) {
+    const existing = await prisma.clientSpotCreate.findUnique({
+      where: { ownerId_clientKey: { ownerId: user.id, clientKey: input.clientKey } },
+      select: { spotUuid: true },
+    });
+    if (existing) {
+      return getSpotByUuid(existing.spotUuid, user);
+    }
+  }
+
   const category = await requireCategoryByCode(input.categoryCode);
 
   if (!isValidLatLng(input.lat, input.lng)) throw AppError.badRequest("坐标不合法");
@@ -313,6 +325,24 @@ export async function createDraft(user: AuthUser, input: CreateSpotInput) {
     await attachMedia(spot.id, user.id, input.mediaUuids);
   }
 
+  if (input.clientKey) {
+    // 并发重试下唯一索引是最后一道防线：撞键时以先到的那条草稿为准
+    try {
+      await prisma.clientSpotCreate.create({
+        data: { ownerId: user.id, clientKey: input.clientKey, spotId: spot.id, spotUuid: spot.uuid },
+      });
+    } catch (error) {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+        const winner = await prisma.clientSpotCreate.findUniqueOrThrow({
+          where: { ownerId_clientKey: { ownerId: user.id, clientKey: input.clientKey } },
+          select: { spotUuid: true },
+        });
+        return getSpotByUuid(winner.spotUuid, user);
+      }
+      throw error;
+    }
+  }
+
   return getSpotByUuid(spot.uuid, user);
 }
 
@@ -329,6 +359,34 @@ export async function updateSpot(uuid: string, user: AuthUser, input: UpdateSpot
       ERROR_CODES.SPOT_STATE_INVALID,
       `当前状态（${spot.status}）不能编辑，请先撤回或等待审核结果`,
     );
+  }
+
+  // 乐观锁：离线补传/多端同时编辑时，客户端带着它上次读到的 updatedAt。
+  // 服务端版本更新就返回 409，并把最新内容放进 details，
+  // 前端按字段时间戳合并后让用户确认最终结果，再确认入库。
+  if (input.baseUpdatedAt !== undefined) {
+    const baseTime = Date.parse(input.baseUpdatedAt);
+    if (Number.isNaN(baseTime) || Math.abs(baseTime - spot.updatedAt.getTime()) > 999) {
+      const fresh = await prisma.spot.findUnique({ where: { uuid }, include: baseInclude });
+      if (fresh) {
+        const confirmed = await lastConfirmedMap([fresh.id]);
+        const media = await prisma.mediaAsset.findMany({
+          where: { spotId: fresh.id },
+          select: { uuid: true, width: true, height: true, privacyStatus: true, variantVersion: true },
+          orderBy: { id: "asc" },
+        });
+        const latest = serializeSpot(
+          {
+            ...toSpotLike(fresh, confirmed.get(fresh.id.toString()) ?? null),
+            media,
+          },
+          { includeExact: true },
+        );
+        throw new AppError(409, ERROR_CODES.SPOT_VERSION_CONFLICT, "这条记录已在其他设备上被修改，请确认合并结果", {
+          current: latest,
+        });
+      }
+    }
   }
 
   const data: Prisma.SpotUpdateInput = {};

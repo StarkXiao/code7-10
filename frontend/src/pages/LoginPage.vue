@@ -5,6 +5,7 @@ import { ElMessage } from "element-plus";
 import { api } from "@/api/client";
 import { useAuthStore } from "@/stores/auth";
 import { useNotificationStore } from "@/stores/notifications";
+import { syncQueue } from "@/offline/queue";
 
 const auth = useAuthStore();
 const notifications = useNotificationStore();
@@ -51,6 +52,8 @@ async function submit() {
         : undefined,
     );
     await notifications.load().catch(() => undefined);
+    // 登录后凭证才可用，立刻尝试补传本机草稿
+    syncQueue.kick();
     ElMessage.success("登录成功");
     void router.replace(redirect.value);
   } catch (error) {
